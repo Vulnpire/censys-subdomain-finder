@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 
+import sys
+import os
+import time
 from censys.search import CensysCerts
 from censys.common.exceptions import (
     CensysUnauthorizedException,
@@ -7,27 +10,28 @@ from censys.common.exceptions import (
     CensysException,
 )
 from dotenv import load_dotenv
-import sys
-import cli
-import os
-import time
+import argparse
 
 load_dotenv()
 
-USER_AGENT = f"{CensysCerts.DEFAULT_USER_AGENT} (censys-subdomain-finder; +https://github.com/christophetd/censys-subdomain-finder)"
-
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 MAX_PER_PAGE = 100
 COMMUNITY_PAGES = 10
 
+def read_file(filename):
+    """Read lines from a file and return them as a list."""
+    with open(filename, 'r') as file:
+        return [line.strip() for line in file.readlines()]
 
 # Finds subdomains of a domain using Censys API
 def find_subdomains(domain, api_id, api_secret, limit_results):
+    subdomains = set()
     try:
         censys_certificates = CensysCerts(
             api_id=api_id, api_secret=api_secret, user_agent=USER_AGENT
         )
         certificate_query = "names: %s" % domain
-        pages = -1 # unlimited
+        pages = -1  # unlimited
         if limit_results:
             pages = COMMUNITY_PAGES
         certificates_search_results = censys_certificates.search(
@@ -36,13 +40,10 @@ def find_subdomains(domain, api_id, api_secret, limit_results):
             pages=pages
         )
 
-        # Flatten the result, and remove duplicates
-        subdomains = []
         for page in certificates_search_results:
             for search_result in page:
-                subdomains.extend(search_result["names"])
+                subdomains.update(search_result["names"])
 
-        return set(subdomains)
     except CensysUnauthorizedException:
         sys.stderr.write("[-] Your Censys credentials look invalid.\n")
         exit(1)
@@ -50,12 +51,10 @@ def find_subdomains(domain, api_id, api_secret, limit_results):
         sys.stderr.write(
             "[-] Looks like you exceeded your Censys account limits rate. Exiting\n"
         )
-        return set(subdomains)
     except CensysException as e:
-        # catch the Censys Base exception, example "only 1000 first results are available"
-        sys.stderr.write("[-] Something bad happened, " + repr(e))
-        return set(subdomains)
+        sys.stderr.write("[-] Something bad happened, " + repr(e) + "\n")
 
+    return subdomains
 
 # Filters out uninteresting subdomains
 def filter_subdomains(domain, subdomains):
@@ -65,27 +64,10 @@ def filter_subdomains(domain, subdomains):
         if "*" not in subdomain and subdomain.endswith(domain) and subdomain != domain
     ]
 
-
-# Prints the list of found subdomains to stdout
-def print_subdomains(domain, subdomains, time_elapsed):
-    if len(subdomains) == 0:
-        print("[-] Did not find any subdomain")
-        return
-
-    print(
-        "[*] Found %d unique subdomain%s of %s in ~%s seconds\n"
-        % (
-            len(subdomains),
-            "s" if len(subdomains) > 1 else "",
-            domain,
-            str(time_elapsed),
-        )
-    )
+# Prints the list of found subdomains to stdout (clear output: only subdomains)
+def print_subdomains(subdomains):
     for subdomain in subdomains:
-        print("  - " + subdomain)
-
-    print("")
-
+        print(subdomain)
 
 # Saves the list of found subdomains to an output file
 def save_subdomains_to_file(subdomains, output_file):
@@ -96,56 +78,69 @@ def save_subdomains_to_file(subdomains, output_file):
         with open(output_file, "w") as f:
             for subdomain in subdomains:
                 f.write(subdomain + "\n")
-
-        print(
-            "[*] Wrote %d subdomains to %s"
-            % (len(subdomains), os.path.abspath(output_file))
-        )
     except IOError as e:
         sys.stderr.write(
             "[-] Unable to write to output file %s : %s\n" % (output_file, e)
         )
 
-
-def main(domain, output_file, censys_api_id, censys_api_secret, limit_results):
-    print("[*] Searching Censys for subdomains of %s" % domain)
-    start_time = time.time()
+def process_domain(domain, output_file, censys_api_id, censys_api_secret, limit_results):
     subdomains = find_subdomains(
         domain, censys_api_id, censys_api_secret, limit_results
     )
     subdomains = filter_subdomains(domain, subdomains)
-    end_time = time.time()
-    time_elapsed = round(end_time - start_time, 1)
-    print_subdomains(domain, subdomains, time_elapsed)
+    print_subdomains(subdomains)
     save_subdomains_to_file(subdomains, output_file)
 
+def main(domains, output_file, censys_api_id, censys_api_secret, limit_results):
+    for domain in domains:
+        process_domain(domain, output_file, censys_api_id, censys_api_secret, limit_results)
 
 if __name__ == "__main__":
-    args = cli.parser.parse_args()
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Find subdomains using the Censys API.")
+    parser.add_argument(
+        "-d", "--domain", type=str, help="The domain to search for subdomains."
+    )
+    parser.add_argument(
+        "-i", "--input-file", type=str, help="File with list of domains to search for subdomains."
+    )
+    parser.add_argument(
+        "-o", "--output-file", type=str, help="File to save the list of found subdomains."
+    )
+    parser.add_argument(
+        "-c", "--censys-api-id", type=str, help="Censys API ID."
+    )
+    parser.add_argument(
+        "-s", "--censys-api-secret", type=str, help="Censys API Secret."
+    )
+    parser.add_argument(
+        "--commercial", action="store_true", help="Use commercial account limits (unlimited results)."
+    )
 
-    censys_api_id = None
-    censys_api_secret = None
+    args = parser.parse_args()
 
-    if "CENSYS_API_ID" in os.environ and "CENSYS_API_SECRET" in os.environ:
-        censys_api_id = os.environ["CENSYS_API_ID"]
-        censys_api_secret = os.environ["CENSYS_API_SECRET"]
+    censys_api_id = args.censys_api_id or os.getenv("CENSYS_API_ID")
+    censys_api_secret = args.censys_api_secret or os.getenv("CENSYS_API_SECRET")
 
-    if args.censys_api_id and args.censys_api_secret:
-        censys_api_id = args.censys_api_id
-        censys_api_secret = args.censys_api_secret
-
-    limit_results = not args.commercial
-    if limit_results:
-        print(
-            f"[*] Applying free plan limits ({MAX_PER_PAGE * COMMUNITY_PAGES} results at most)"
-        )
-    else:
-        print("[*] No limits applied, getting all results")
-
-    if None in [censys_api_id, censys_api_secret]:
+    if not censys_api_id or not censys_api_secret:
         sys.stderr.write(
-            "[!] Please set your Censys API ID and secret from your environment (CENSYS_API_ID and CENSYS_API_SECRET) or from the command line.\n"
+            "[!] Please set your Censys API ID and secret using environment variables or command-line arguments.\n"
         )
         exit(1)
 
-    main(args.domain, args.output_file, censys_api_id, censys_api_secret, limit_results)
+    limit_results = not args.commercial
+    if limit_results:
+        sys.stderr.write(
+            f"[*] Applying free plan limits ({MAX_PER_PAGE * COMMUNITY_PAGES} results at most)\n"
+        )
+
+    if args.input_file:
+        domains = read_file(args.input_file)
+    elif args.domain:
+        domains = [args.domain]
+    else:
+        sys.stderr.write("[!] You must provide a domain or an input file with domains.\n")
+        exit(1)
+
+    main(domains, args.output_file, censys_api_id, censys_api_secret, limit_results)
+
